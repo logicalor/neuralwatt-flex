@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "./plugins/neuralwatt-flex/src/neuralwatt-flex.ts"
+  ],
+  "permission": {
+    "tool": {
+      "flex-session": "allow",
+      "flex-stats": "allow"
+    }
+  }
+}

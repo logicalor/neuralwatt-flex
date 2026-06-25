@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# opencode local state (session memory, sqlite db) — never commit
+.opencode/
+
+# Build output (no build step today, but ignore if added later)
+dist/
+build/
+
+# SQLite / local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env / secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
