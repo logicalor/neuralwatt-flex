@@ -86,7 +86,7 @@ Energy (kWh), carbon (gCO2eq) and grid id come from NeuralWatt's `:energy` SSE t
 
 ## Sample output
 
-A trimmed `flex-session` report (real reports vary; see [`docs/use-cases/session-report.md`](docs/use-cases/session-report.md) for a genuine captured run):
+A trimmed `flex-session` report (real reports vary; see [`docs/use-cases/tic-tac-toe/`](docs/use-cases/tic-tac-toe/) for a genuine captured run):
 
 ```
 ==============================================================================
@@ -95,13 +95,15 @@ NeuralWatt Flex Stats — Session <session-id>
 
 Main Session (agent: bmad-orchestrator):
 
-  Model                  Flex   API    Tokens   Est.Cost    Act.Cost        Energy Grid
+  Model                  API    Tokens   Est.Cost    Act.Cost        Energy Grid
   ─────────────────────────────────────────────────────────────────────────────────────
-  neuralwatt/glm-5.2       12    12      8,421     $0.0143      $0.0091  3.40e-4 kWh WEU
+  neuralwatt/glm-5.2       12      8,421     $0.0143      $0.0091  3.40e-4 kWh WEU
   ─────────────────────────────────────────────────────────────────────────────────────
-  Total                    12    12      8,421     $0.0143      $0.0091  3.40e-4 kWh
+  Total                    12      8,421     $0.0143      $0.0091  3.40e-4 kWh
 
 Combined: 12 flex turns (12 API calls)  8,421 tokens
+  Flex:        12 turns   8,421 tokens   Est $0.0143   Billed $0.0091
+  Non-flex:     0 turns       0 tokens   Est $0        Billed $0
   Estimated cost (models.dev): $0.0143
   Actual billed cost (NeuralWatt): $0.0091
   Energy: 3.40e-4 kWh  Carbon: 7.10e-2g  Grid: WEU
@@ -110,8 +112,8 @@ Combined: 12 flex turns (12 API calls)  8,421 tokens
 Disabled models: (none)
 
 ==============================================================================
-Note: "Est.Cost" = opencode models.dev estimate (no flex discount).
-"Act.Cost" = NeuralWatt actual billed cost (includes flex discount).
+Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.
+"Est.Cost" = opencode models.dev estimate (list price). "Billed" = NeuralWatt actual.
 ==============================================================================
 ```
 
@@ -141,7 +143,7 @@ The source is one file: [`src/neuralwatt-flex.ts`](src/neuralwatt-flex.ts).
 
 ## Use cases
 
-- [`docs/use-cases/session-report.md`](docs/use-cases/session-report.md) — a real `flex-session` / `flex-stats` capture from the session that set up this repository.
+- [`docs/use-cases/tic-tac-toe/`](docs/use-cases/tic-tac-toe/) — a single-file tic-tac-toe app built across an orchestrator and a `bmad-dev` subagent, plus verbatim `flex-session` / `flex-stats` reports from that build.
 
 ## License
 

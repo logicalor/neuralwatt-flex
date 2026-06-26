@@ -6,9 +6,11 @@ const NEURALWATT_HOST = "api.neuralwatt.com"
 
 // ============ Types ============
 
+type Tier = "flex" | "std"
+
 interface ModelStats {
   agent: string
-  flexInjected: number
+  tier: Tier
   skipped: number
   apiCalls: number
   tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
@@ -22,29 +24,52 @@ interface ModelStats {
   lastAllowanceRemaining: number | undefined
 }
 
+interface ModelTiers {
+  flex: ModelStats
+  std: ModelStats
+}
+
 // ============ State ============
 
-const sessions = new Map<string, Map<string, ModelStats>>()
+const sessions = new Map<string, Map<string, ModelTiers>>()
 const disabledModels = new Set<string>()
-const sessionInfo = new Map<string, { modelID: string; agent: string }>()
+const sessionInfo = new Map<string, { modelID: string; agent: string; flex: boolean }>()
 const captureBySession = new Map<string, Array<{ energy?: any; cost?: any }>>()
 const captureByModel = new Map<string, Array<{ energy?: any; cost?: any }>>()
 const lastTokensByMsg = new Map<string, { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number; cost: number }>()
 
 // ============ Helpers ============
 
-function getOrCreateModel(sessionID: string, modelID: string, agent: string): ModelStats {
+function newStats(agent: string, tier: Tier): ModelStats {
+  return {
+    agent, tier, skipped: 0, apiCalls: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    estimatedCost: 0, energyJoules: 0, energyKwh: 0, carbonG: 0, gridId: "",
+    actualCost: 0, cacheSavings: 0, lastAllowanceRemaining: undefined,
+  }
+}
+
+function getOrCreateModel(sessionID: string, modelID: string, agent: string, flex: boolean): ModelStats {
   if (!sessions.has(sessionID)) sessions.set(sessionID, new Map())
   const sess = sessions.get(sessionID)!
-  if (!sess.has(modelID)) {
-    sess.set(modelID, {
-      agent, flexInjected: 0, skipped: 0, apiCalls: 0,
-      tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-      estimatedCost: 0, energyJoules: 0, energyKwh: 0, carbonG: 0, gridId: "",
-      actualCost: 0, cacheSavings: 0, lastAllowanceRemaining: undefined,
-    })
+  let tiers = sess.get(modelID)
+  if (!tiers) {
+    tiers = { flex: newStats(agent, "flex"), std: newStats(agent, "std") }
+    sess.set(modelID, tiers)
   }
-  return sess.get(modelID)!
+  return flex ? tiers.flex : tiers.std
+}
+
+function tokenTotal(s: ModelStats): number {
+  return s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite
+}
+
+function hasActivity(s: ModelStats): boolean {
+  return s.apiCalls > 0 || s.skipped > 0 || tokenTotal(s) > 0 || s.actualCost > 0 || s.energyKwh > 0
+}
+
+function tierLabel(modelID: string, tier: Tier): string {
+  return tier === "flex" ? modelID : `${modelID} [std]`
 }
 
 function pad(str: string, len: number): string {
@@ -84,6 +109,24 @@ function popCapture(sessionID: string, modelID: string): { energy?: any; cost?: 
   return undefined
 }
 
+function addInto(dst: ModelStats, src: ModelStats): void {
+  dst.skipped += src.skipped
+  dst.apiCalls += src.apiCalls
+  dst.tokens.input += src.tokens.input
+  dst.tokens.output += src.tokens.output
+  dst.tokens.reasoning += src.tokens.reasoning
+  dst.tokens.cacheRead += src.tokens.cacheRead
+  dst.tokens.cacheWrite += src.tokens.cacheWrite
+  dst.estimatedCost += src.estimatedCost
+  dst.energyJoules += src.energyJoules
+  dst.energyKwh += src.energyKwh
+  dst.carbonG += src.carbonG
+  dst.actualCost += src.actualCost
+  dst.cacheSavings += src.cacheSavings
+  if (src.lastAllowanceRemaining !== undefined) dst.lastAllowanceRemaining = src.lastAllowanceRemaining
+  if (src.gridId) dst.gridId = src.gridId
+}
+
 // ============ SSE Parsing ============
 
 function parseSSELine(line: string, captured: { energy?: any; cost?: any }): void {
@@ -114,11 +157,11 @@ function patchFetch(): void {
       else if (input instanceof URL) url = input.href
       else url = (input as Request).url
     } catch {
-      return _originalFetch.call(this, input as any, init)
+      return _originalFetch(input as any, init)
     }
 
     if (!url.includes(NEURALWATT_HOST) || !url.includes("chat/completions")) {
-      return _originalFetch.call(this, input as any, init)
+      return _originalFetch(input as any, init)
     }
 
     let modelID: string | undefined
@@ -134,7 +177,7 @@ function patchFetch(): void {
       } catch {}
     }
 
-    const response = await _originalFetch.call(this, input as any, init)
+    const response = await _originalFetch(input as any, init)
 
     const ct = response.headers.get("content-type") ?? ""
     if (!response.body || !ct.includes("text/event-stream")) return response
@@ -184,25 +227,33 @@ function patchFetch(): void {
 const BAR = "=".repeat(78)
 const DASH = "─".repeat(78)
 
-function modelTable(models: Map<string, ModelStats>): string[] {
+function modelTierRows(label: string, s: ModelStats, W: { model: number; api: number; tokens: number; est: number; act: number; energy: number; grid: number }): { line: string; active: boolean } {
+  if (!hasActivity(s)) return { line: "", active: false }
+  const flag = s.tier === "std" && disabledModels.has(label.split(" [")[0]) ? " *" : ""
+  const line =
+    `  ${pad(tierLabel(label, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)} ${pad(s.gridId || "—", W.grid)}`
+  return { line, active: true }
+}
+
+function modelTable(models: Map<string, ModelTiers>): string[] {
   const lines: string[] = []
-  const W = { model: 22, flex: 5, api: 5, tokens: 10, est: 10, act: 12, energy: 14, grid: 5 }
-  const hdr = `  ${pad("Model", W.model)} ${padR("Flex", W.flex)} ${padR("API", W.api)} ${padR("Tokens", W.tokens)} ${padR("Est.Cost", W.est)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)} ${pad("Grid", W.grid)}`
+  const W = { model: 24, api: 5, tokens: 10, est: 10, act: 12, energy: 14, grid: 5 }
+  const hdr = `  ${pad("Model", W.model)} ${padR("API", W.api)} ${padR("Tokens", W.tokens)} ${padR("Est.Cost", W.est)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)} ${pad("Grid", W.grid)}`
   lines.push(hdr)
   lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
 
-  let tFlex = 0, tApi = 0, tTokens = 0, tEst = 0, tAct = 0, tEnergy = 0
-  for (const [modelID, s] of models) {
-    const flag = disabledModels.has(modelID) ? " *" : ""
-    lines.push(
-      `  ${pad(modelID + flag, W.model)} ${padR(String(s.flexInjected), W.flex)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)} ${pad(s.gridId || "—", W.grid)}`
-    )
-    tFlex += s.flexInjected; tApi += s.apiCalls
-    tTokens += s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite
-    tEst += s.estimatedCost; tAct += s.actualCost; tEnergy += s.energyKwh
+  let tApi = 0, tTokens = 0, tEst = 0, tAct = 0, tEnergy = 0
+  for (const [modelID, tiers] of models) {
+    for (const s of [tiers.flex, tiers.std]) {
+      const row = modelTierRows(modelID, s, W)
+      if (!row.active) continue
+      lines.push(row.line)
+      tApi += s.apiCalls; tTokens += tokenTotal(s)
+      tEst += s.estimatedCost; tAct += s.actualCost; tEnergy += s.energyKwh
+    }
   }
   lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
-  lines.push(`  ${pad("Total", W.model)} ${padR(String(tFlex), W.flex)} ${padR(String(tApi), W.api)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tEst), W.est)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
+  lines.push(`  ${pad("Total", W.model)} ${padR(String(tApi), W.api)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tEst), W.est)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
   return lines
 }
 
@@ -235,7 +286,7 @@ async function formatSessionStats(client: any, sessionID: string): Promise<strin
   // Main session
   const mainSession = sessions.get(sessionID)
   if (mainSession && mainSession.size > 0) {
-    const agent = mainSession.values().next().value?.agent ?? "unknown"
+    const agent = mainSession.values().next().value?.flex.agent ?? "unknown"
     lines.push(`Main Session (agent: ${agent}):`)
     lines.push("")
     lines.push(...modelTable(mainSession))
@@ -250,61 +301,70 @@ async function formatSessionStats(client: any, sessionID: string): Promise<strin
   if (childWithStats.length > 0) {
     lines.push(`Subagents (${childWithStats.length} child sessions):`)
     lines.push("")
-    const W = { sid: 20, agent: 14, model: 22, flex: 5, api: 5, tokens: 10, act: 12, energy: 14 }
-    const hdr = `  ${pad("Session", W.sid)} ${pad("Agent", W.agent)} ${pad("Model", W.model)} ${padR("Flex", W.flex)} ${padR("API", W.api)} ${padR("Tokens", W.tokens)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)}`
+    const W = { sid: 20, agent: 14, model: 24, api: 5, tokens: 10, act: 12, energy: 14 }
+    const hdr = `  ${pad("Session", W.sid)} ${pad("Agent", W.agent)} ${pad("Model", W.model)} ${padR("API", W.api)} ${padR("Tokens", W.tokens)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)}`
     lines.push(hdr)
     lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
 
-    let tFlex = 0, tApi = 0, tTokens = 0, tAct = 0, tEnergy = 0
+    let tApi = 0, tTokens = 0, tAct = 0, tEnergy = 0
     for (const child of childWithStats) {
       const sess = sessions.get(child.id)!
-      for (const [modelID, s] of sess) {
-        lines.push(
-          `  ${pad(child.id, W.sid)} ${pad(s.agent, W.agent)} ${pad(modelID, W.model)} ${padR(String(s.flexInjected), W.flex)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite), W.tokens)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
-        )
-        tFlex += s.flexInjected; tApi += s.apiCalls
-        tTokens += s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite
-        tAct += s.actualCost; tEnergy += s.energyKwh
+      for (const [modelID, tiers] of sess) {
+        for (const s of [tiers.flex, tiers.std]) {
+          if (!hasActivity(s)) continue
+          const flag = s.tier === "std" && disabledModels.has(modelID) ? " *" : ""
+          lines.push(
+            `  ${pad(child.id, W.sid)} ${pad(s.agent, W.agent)} ${pad(tierLabel(modelID, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
+          )
+          tApi += s.apiCalls; tTokens += tokenTotal(s)
+          tAct += s.actualCost; tEnergy += s.energyKwh
+        }
       }
     }
     lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
-    lines.push(`  ${pad("Subtotal", W.sid + W.agent + W.model + 2)} ${padR(String(tFlex), W.flex)} ${padR(String(tApi), W.api)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
+    lines.push(`  ${pad("Subtotal", W.sid + W.agent + W.model + 2)} ${padR(String(tApi), W.api)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
     lines.push("")
   }
 
   // Combined totals
-  let cFlex = 0, cApi = 0, cTokens = 0, cEst = 0, cAct = 0, cEnergy = 0, cCarbon = 0
+  let fApi = 0, fTokens = 0, fEst = 0, fAct = 0, fEnergy = 0, fCarbon = 0
+  let sApi = 0, sTokens = 0, sEst = 0, sAct = 0
+  let cEnergy = 0, cCarbon = 0
   let cGrid = ""
   const allSessions = [sessionID, ...children.map(c => c.id)]
   for (const sid of allSessions) {
     const sess = sessions.get(sid)
     if (!sess) continue
-    for (const s of sess.values()) {
-      cFlex += s.flexInjected; cApi += s.apiCalls
-      cTokens += s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite
-      cEst += s.estimatedCost; cAct += s.actualCost
-      cEnergy += s.energyKwh; cCarbon += s.carbonG
-      if (s.gridId) cGrid = s.gridId
+    for (const tiers of sess.values()) {
+      const f = tiers.flex, st = tiers.std
+      fApi += f.apiCalls; fTokens += tokenTotal(f); fEst += f.estimatedCost; fAct += f.actualCost
+      sApi += st.apiCalls; sTokens += tokenTotal(st); sEst += st.estimatedCost; sAct += st.actualCost
+      cEnergy += f.energyKwh + st.energyKwh; cCarbon += f.carbonG + st.carbonG
+      if (f.gridId) cGrid = f.gridId
+      if (st.gridId) cGrid = st.gridId
     }
   }
-  lines.push(`Combined: ${cFlex} flex turns (${cApi} API calls)  ${fmtTokens(cTokens)} tokens`)
-  lines.push(`  Estimated cost (models.dev): ${fmtCost(cEst)}`)
-  lines.push(`  Actual billed cost (NeuralWatt): ${fmtCost(cAct)}`)
+  const totalApi = fApi + sApi, totalTokens = fTokens + sTokens, totalEst = fEst + sEst, totalAct = fAct + sAct
+  lines.push(`Combined: ${totalApi} turns (${fmtTokens(totalTokens)} tokens)`)
+  lines.push(`  Flex:        ${fApi} turns  ${fmtTokens(fTokens)} tokens   Est ${fmtCost(fEst)}   Billed ${fmtCost(fAct)}`)
+  lines.push(`  Non-flex:    ${sApi} turns  ${fmtTokens(sTokens)} tokens   Est ${fmtCost(sEst)}   Billed ${fmtCost(sAct)}`)
+  lines.push(`  Estimated cost (models.dev): ${fmtCost(totalEst)}`)
+  lines.push(`  Actual billed cost (NeuralWatt): ${fmtCost(totalAct)}`)
   if (cEnergy > 0) {
     lines.push(`  Energy: ${fmtKwh(cEnergy)}  Carbon: ${fmtCarbon(cCarbon)}  Grid: ${cGrid || "—"}`)
   }
-  const lastAllowance = [...allSessions].reverse().map(sid => sessions.get(sid)).filter(Boolean).flatMap(s => [...s!.values()].map(m => m.lastAllowanceRemaining)).find(v => v !== undefined)
+  const lastAllowance = [...allSessions].reverse().map(sid => sessions.get(sid)).filter(Boolean).flatMap(s => [...s!.values()].flatMap(t => [t.flex, t.std]).map(m => m.lastAllowanceRemaining)).find(v => v !== undefined)
   if (lastAllowance !== undefined) {
     lines.push(`  Allowance remaining: ${fmtCost(lastAllowance)}`)
   }
 
   lines.push("")
   lines.push(`Disabled models: ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
-  if (disabledModels.size > 0) lines.push("  (* = disabled for flex injection)")
+  if (disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
   lines.push("")
   lines.push(BAR)
-  lines.push('Note: "Est.Cost" = opencode models.dev estimate (no flex discount).')
-  lines.push('"Act.Cost" = NeuralWatt actual billed cost (includes flex discount).')
+  lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
+  lines.push('"Est.Cost" = opencode models.dev estimate (list price). "Billed" = NeuralWatt actual.')
   lines.push(BAR)
   return lines.join("\n")
 }
@@ -316,30 +376,15 @@ function formatOverallStats(): string {
   lines.push(BAR)
   lines.push("")
 
-  // Aggregate by agent × model
+  // Aggregate by agent × model × tier
   const agg = new Map<string, ModelStats>()
   for (const [, models] of sessions) {
-    for (const [modelID, s] of models) {
-      const key = `${s.agent}\u0000${modelID}`
-      const existing = agg.get(key)
-      if (existing) {
-        existing.flexInjected += s.flexInjected
-        existing.skipped += s.skipped
-        existing.apiCalls += s.apiCalls
-        existing.tokens.input += s.tokens.input
-        existing.tokens.output += s.tokens.output
-        existing.tokens.reasoning += s.tokens.reasoning
-        existing.tokens.cacheRead += s.tokens.cacheRead
-        existing.tokens.cacheWrite += s.tokens.cacheWrite
-        existing.estimatedCost += s.estimatedCost
-        existing.energyJoules += s.energyJoules
-        existing.energyKwh += s.energyKwh
-        existing.carbonG += s.carbonG
-        existing.actualCost += s.actualCost
-        existing.cacheSavings += s.cacheSavings
-        if (s.lastAllowanceRemaining !== undefined) existing.lastAllowanceRemaining = s.lastAllowanceRemaining
-      } else {
-        agg.set(key, { ...s, tokens: { ...s.tokens } })
+    for (const [modelID, tiers] of models) {
+      for (const s of [tiers.flex, tiers.std]) {
+        const key = `${s.agent}\u0000${modelID}\u0000${s.tier}`
+        const existing = agg.get(key)
+        if (existing) addInto(existing, s)
+        else agg.set(key, { ...s, tokens: { ...s.tokens } })
       }
     }
   }
@@ -351,43 +396,47 @@ function formatOverallStats(): string {
     return lines.join("\n")
   }
 
-  const W = { agent: 14, model: 22, flex: 5, api: 5, sess: 8, tokens: 10, est: 10, act: 12, energy: 14 }
-  const hdr = `  ${pad("Agent", W.agent)} ${pad("Model", W.model)} ${padR("Flex", W.flex)} ${padR("API", W.api)} ${padR("Sess", W.sess)} ${padR("Tokens", W.tokens)} ${padR("Est.Cost", W.est)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)}`
+  const W = { agent: 14, model: 24, api: 5, sess: 8, tokens: 10, est: 10, act: 12, energy: 14 }
+  const hdr = `  ${pad("Agent", W.agent)} ${pad("Model", W.model)} ${padR("API", W.api)} ${padR("Sess", W.sess)} ${padR("Tokens", W.tokens)} ${padR("Est.Cost", W.est)} ${padR("Act.Cost", W.act)} ${padR("Energy", W.energy)}`
   lines.push(hdr)
   lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
 
-  const sessionCountByAgentModel = new Map<string, Set<string>>()
+  const sessionCountByAgentModelTier = new Map<string, Set<string>>()
   for (const [sid, models] of sessions) {
-    for (const [modelID, s] of models) {
-      const key = `${s.agent}\u0000${modelID}`
-      if (!sessionCountByAgentModel.has(key)) sessionCountByAgentModel.set(key, new Set())
-      sessionCountByAgentModel.get(key)!.add(sid)
+    for (const [modelID, tiers] of models) {
+      for (const s of [tiers.flex, tiers.std]) {
+        const key = `${s.agent}\u0000${modelID}\u0000${s.tier}`
+        if (!sessionCountByAgentModelTier.has(key)) sessionCountByAgentModelTier.set(key, new Set())
+        sessionCountByAgentModelTier.get(key)!.add(sid)
+      }
     }
   }
 
-  let tFlex = 0, tApi = 0, tTokens = 0, tEst = 0, tAct = 0, tEnergy = 0, tCarbon = 0
+  let tApi = 0, tTokens = 0, tEst = 0, tAct = 0, tEnergy = 0, tCarbon = 0
+  let fApi = 0, sApi = 0, fEst = 0, sEst = 0, fAct = 0, sAct = 0
   let tGrid = ""
-  const sorted = [...agg.entries()].sort((a, b) => b[1].flexInjected - a[1].flexInjected)
+  const sorted = [...agg.entries()].sort((a, b) => b[1].apiCalls - a[1].apiCalls)
   for (const [key, s] of sorted) {
+    if (!hasActivity(s)) continue
     const [agent, modelID] = key.split("\u0000")
-    const sessCount = sessionCountByAgentModel.get(key)?.size ?? 0
-    const flag = disabledModels.has(modelID) ? " *" : ""
+    const sessCount = sessionCountByAgentModelTier.get(key)?.size ?? 0
+    const flag = s.tier === "std" && disabledModels.has(modelID) ? " *" : ""
     lines.push(
-      `  ${pad(agent, W.agent)} ${pad(modelID + flag, W.model)} ${padR(String(s.flexInjected), W.flex)} ${padR(String(s.apiCalls), W.api)} ${padR(String(sessCount), W.sess)} ${padR(fmtTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
+      `  ${pad(agent, W.agent)} ${pad(tierLabel(modelID, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(String(sessCount), W.sess)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
     )
-    tFlex += s.flexInjected; tApi += s.apiCalls
-    tTokens += s.tokens.input + s.tokens.output + s.tokens.reasoning + s.tokens.cacheRead + s.tokens.cacheWrite
+    tApi += s.apiCalls; tTokens += tokenTotal(s)
     tEst += s.estimatedCost; tAct += s.actualCost
     tEnergy += s.energyKwh; tCarbon += s.carbonG
     if (s.gridId) tGrid = s.gridId
+    if (s.tier === "flex") { fApi += s.apiCalls; fEst += s.estimatedCost; fAct += s.actualCost }
+    else { sApi += s.apiCalls; sEst += s.estimatedCost; sAct += s.actualCost }
   }
   lines.push(`  ${DASH.slice(0, hdr.length - 2)}`)
-  lines.push(`  ${pad("Total", W.agent + W.model + 1)} ${padR(String(tFlex), W.flex)} ${padR(String(tApi), W.api)} ${padR(String(sessions.size), W.sess)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tEst), W.est)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
+  lines.push(`  ${pad("Total", W.agent + W.model + 1)} ${padR(String(tApi), W.api)} ${padR(String(sessions.size), W.sess)} ${padR(fmtTokens(tTokens), W.tokens)} ${padR(fmtCost(tEst), W.est)} ${padR(fmtCost(tAct), W.act)} ${padR(fmtKwh(tEnergy), W.energy)}`)
 
-  const totalSkipped = [...sessions.values()].flatMap(m => [...m.values()]).reduce((sum, s) => sum + s.skipped, 0)
-  const totalTurns = tFlex + totalSkipped
-  const flexRate = totalTurns > 0 ? ((tFlex / totalTurns) * 100).toFixed(1) : "0.0"
-  lines.push(`  Flex rate: ${flexRate}%`)
+  const flexRate = tApi > 0 ? ((fApi / tApi) * 100).toFixed(1) : "0.0"
+  lines.push(`  Flex rate: ${flexRate}%  (${fApi} flex / ${sApi} non-flex turns)`)
+  lines.push(`  Flex billed: ${fmtCost(fAct)}   Non-flex billed: ${fmtCost(sAct)}`)
 
   if (tEnergy > 0) {
     lines.push(`  Energy: ${fmtKwh(tEnergy)}  Carbon: ${fmtCarbon(tCarbon)}  Grid: ${tGrid || "—"}`)
@@ -404,11 +453,11 @@ function formatOverallStats(): string {
 
   lines.push("")
   lines.push(`Disabled models: ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
-  if (disabledModels.size > 0) lines.push("  (* = disabled for flex injection)")
+  if (disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
   lines.push("")
   lines.push(BAR)
-  lines.push('Note: "Est.Cost" = opencode models.dev estimate (no flex discount).')
-  lines.push('"Act.Cost" = NeuralWatt actual billed cost (includes flex discount).')
+  lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
+  lines.push('"Est.Cost" = opencode models.dev estimate (list price). "Act.Cost" = NeuralWatt actual.')
   lines.push("Energy/carbon from NeuralWatt SSE telemetry.")
   lines.push(BAR)
   return lines.join("\n")
@@ -424,21 +473,21 @@ export default (async ({ client }) => {
       const providerID = input.provider?.info?.id ?? input.model?.providerID
       if (providerID !== NEURALWATT_PROVIDER_ID) return
 
-      const modelID = input.model?.modelID ?? "unknown"
-      const sessionID = input.sessionID ?? "unknown"
       const agent = input.agent ?? "unknown"
+      if (agent === "title") return
 
-      sessionInfo.set(sessionID, { modelID, agent })
+      const modelID = input.model?.id ?? "unknown"
+      const sessionID = input.sessionID ?? "unknown"
 
-      const stats = getOrCreateModel(sessionID, modelID, agent)
+      const isFlex = !disabledModels.has(modelID)
+      sessionInfo.set(sessionID, { modelID, agent, flex: isFlex })
 
-      if (disabledModels.has(modelID)) {
-        stats.skipped++
+      if (!isFlex) {
+        getOrCreateModel(sessionID, modelID, agent, false).skipped++
         return
       }
 
       output.options.service_tier = "flex"
-      stats.flexInjected++
     },
 
     "chat.headers": async (input, output) => {
@@ -480,7 +529,9 @@ export default (async ({ client }) => {
         if (dInput !== 0 || dOutput !== 0 || dCost !== 0 || dReasoning !== 0 || dCacheRead !== 0 || dCacheWrite !== 0) {
           const sInfo = sessionInfo.get(sessionID)
           const agent = sInfo?.agent ?? "unknown"
-          const stats = getOrCreateModel(sessionID, modelID, agent)
+          const flex = sInfo?.flex ?? !disabledModels.has(modelID)
+
+          const stats = getOrCreateModel(sessionID, modelID, agent, flex)
 
           stats.apiCalls++
           stats.tokens.input += dInput
@@ -534,7 +585,7 @@ export default (async ({ client }) => {
     tool: {
       "flex-session": tool({
         description:
-          "Show NeuralWatt flex stats for the current session and all subagent child sessions. Per-agent per-model breakdown with flex injection counts, API calls, tokens, estimated cost (models.dev), actual billed cost (NeuralWatt), energy, and carbon emissions.",
+          "Show NeuralWatt flex stats for the current session and all subagent child sessions. Per-model breakdown split into flex (discounted) and non-flex (std fallback) tiers, with API calls, tokens, estimated cost (models.dev), actual billed cost (NeuralWatt), energy, and carbon emissions.",
         args: {},
         async execute(_args, context) {
           const sessionID = context.sessionID ?? "unknown"
@@ -543,7 +594,7 @@ export default (async ({ client }) => {
       }),
       "flex-stats": tool({
         description:
-          "Show overall NeuralWatt flex stats across all sessions in the process lifetime, broken down by agent and model. Includes flex injection counts, API calls, tokens, estimated cost, actual billed cost, energy, and carbon.",
+          "Show overall NeuralWatt flex stats across all sessions in the process lifetime, broken down by agent, model, and tier (flex vs non-flex). Includes API calls, tokens, estimated cost, actual billed cost, flex rate, energy, and carbon.",
         args: {},
         async execute() {
           return formatOverallStats()
