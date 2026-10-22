@@ -6,12 +6,12 @@
     "lib": ["ES2022", "DOM"],
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "isolatedModules": true,
-    "types": ["@opencode-ai/plugin"]
+    "isolatedModules": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["server.ts", "src/**/*.ts"]
 }

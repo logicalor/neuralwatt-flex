@@ -1,5 +1,15 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin/tool"
+/**
+ * neuralwatt-flex — OpenCode V2 plugin
+ *
+ * Silently routes NeuralWatt traffic onto cheaper, lower-priority flex
+ * capacity (`service_tier: "flex"`) whenever it's available, and reports
+ * per-session usage, cost, energy and carbon telemetry.
+ *
+ * Ported from the OpenCode V1 plugin API to the V2 plugin API
+ * (`Plugin.define`-style `{ id, setup(ctx) }` entrypoint).
+ */
+import type { Plugin } from "@opencode/plugin"
+import type { SessionContext } from "@opencode/plugin/promise/session"
 
 const NEURALWATT_PROVIDER_ID = "neuralwatt"
 const NEURALWATT_HOST = "api.neuralwatt.com"
@@ -35,8 +45,6 @@ const sessions = new Map<string, Map<string, ModelTiers>>()
 const disabledModels = new Set<string>()
 const sessionInfo = new Map<string, { modelID: string; agent: string; flex: boolean }>()
 const captureBySession = new Map<string, Array<{ energy?: any; cost?: any }>>()
-const captureByModel = new Map<string, Array<{ energy?: any; cost?: any }>>()
-const lastTokensByMsg = new Map<string, { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number; cost: number }>()
 
 // ============ Helpers ============
 
@@ -101,11 +109,9 @@ function fmtTokens(n: number): string {
   return n.toLocaleString()
 }
 
-function popCapture(sessionID: string, modelID: string): { energy?: any; cost?: any } | undefined {
-  const sq = captureBySession.get(sessionID)
-  if (sq && sq.length > 0) return sq.shift()
-  const mq = captureByModel.get(modelID)
-  if (mq && mq.length > 0) return mq.shift()
+function popCapture(sessionID: string): { energy?: any; cost?: any } | undefined {
+  const queue = captureBySession.get(sessionID)
+  if (queue && queue.length > 0) return queue.shift()
   return undefined
 }
 
@@ -141,85 +147,60 @@ function parseSSELine(line: string, captured: { energy?: any; cost?: any }): voi
   } catch {}
 }
 
-// ============ Fetch Interceptor ============
+/**
+ * Wrap a streaming provider Response with a tee'd copy that watches for
+ * NeuralWatt's `:energy` / `:cost` SSE comment lines and queues them for the
+ * next per-step accounting pass on that session.
+ */
+function interceptResponse(sessionID: string, response: Response): Response {
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const captured: { energy?: any; cost?: any } = {}
 
-const _originalFetch = globalThis.fetch
-let _patched = false
-
-function patchFetch(): void {
-  if (_patched) return
-  _patched = true
-
-  globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    let url = ""
-    try {
-      if (typeof input === "string") url = input
-      else if (input instanceof URL) url = input.href
-      else url = (input as Request).url
-    } catch {
-      return _originalFetch(input as any, init)
-    }
-
-    if (!url.includes(NEURALWATT_HOST) || !url.includes("chat/completions")) {
-      return _originalFetch(input as any, init)
-    }
-
-    let modelID: string | undefined
-    if (init?.body && typeof init.body === "string") {
-      try { modelID = JSON.parse(init.body).model } catch {}
-    }
-
-    let sessionID: string | undefined
-    if (init?.headers) {
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
       try {
-        const h = init.headers instanceof Headers ? init.headers : new Headers(init.headers as any)
-        sessionID = h.get("x-flex-session-id") ?? undefined
-      } catch {}
-    }
-
-    const response = await _originalFetch(input as any, init)
-
-    const ct = response.headers.get("content-type") ?? ""
-    if (!response.body || !ct.includes("text/event-stream")) return response
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ""
-    const captured: { energy?: any; cost?: any } = {}
-
-    const stream = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const { done, value } = await reader.read()
-          if (done) {
-            if (buffer.trim()) parseSSELine(buffer, captured)
-            if ((captured.energy || captured.cost)) {
-              const entry = { ...captured }
-              if (sessionID) {
-                if (!captureBySession.has(sessionID)) captureBySession.set(sessionID, [])
-                captureBySession.get(sessionID)!.push(entry)
-              } else if (modelID) {
-                if (!captureByModel.has(modelID)) captureByModel.set(modelID, [])
-                captureByModel.get(modelID)!.push(entry)
-              }
-            }
-            controller.close()
-            return
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) parseSSELine(buffer, captured)
+          if (captured.energy || captured.cost) {
+            if (!captureBySession.has(sessionID)) captureBySession.set(sessionID, [])
+            captureBySession.get(sessionID)!.push({ ...captured })
           }
-          controller.enqueue(value)
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split("\n")
-          buffer = lines.pop() ?? ""
-          for (const line of lines) parseSSELine(line, captured)
-        } catch (err) {
-          controller.error(err)
+          controller.close()
+          return
         }
-      },
-      cancel(reason) { return reader.cancel(reason) },
-    })
+        controller.enqueue(value)
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() ?? ""
+        for (const line of lines) parseSSELine(line, captured)
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+    cancel(reason) { return reader.cancel(reason) },
+  })
 
-    return new Response(stream, { headers: response.headers, status: response.status, statusText: response.statusText })
-  } as typeof globalThis.fetch
+  return new Response(stream, { headers: response.headers, status: response.status, statusText: response.statusText })
+}
+
+// ============ Session tree ============
+
+async function getChildSessions(ctx: Plugin.Context, sessionID: string): Promise<Array<{ id: string; title: string }>> {
+  const result: Array<{ id: string; title: string }> = []
+  try {
+    const page: any = await ctx.session.list({ parentID: sessionID, limit: 100 })
+    const children: any[] = page?.data ?? (Array.isArray(page) ? page : [])
+    for (const child of children) {
+      const id: string = child?.id ?? ""
+      if (!id) continue
+      result.push({ id, title: child?.title ?? "" })
+      result.push(...(await getChildSessions(ctx, id)))
+    }
+  } catch {}
+  return result
 }
 
 // ============ Formatting ============
@@ -257,26 +238,7 @@ function modelTable(models: Map<string, ModelTiers>): string[] {
   return lines
 }
 
-async function getChildSessions(client: any, sessionID: string): Promise<Array<{ id: string; title: string }>> {
-  const result: Array<{ id: string; title: string }> = []
-  try {
-    const resp = await client.session.children({ path: { id: sessionID } })
-    const children = (resp as any).data ?? (resp as any) ?? []
-    if (Array.isArray(children)) {
-      for (const child of children) {
-        const id: string = child.id ?? child.info?.id ?? ""
-        const title: string = child.title ?? child.info?.title ?? ""
-        if (id) {
-          result.push({ id, title })
-          result.push(...await getChildSessions(client, id))
-        }
-      }
-    }
-  } catch {}
-  return result
-}
-
-async function formatSessionStats(client: any, sessionID: string): Promise<string> {
+async function formatSessionStats(ctx: Plugin.Context, sessionID: string): Promise<string> {
   const lines: string[] = []
   lines.push(BAR)
   lines.push(`NeuralWatt Flex Stats — Session ${sessionID}`)
@@ -296,7 +258,7 @@ async function formatSessionStats(client: any, sessionID: string): Promise<strin
   lines.push("")
 
   // Subagents
-  const children = await getChildSessions(client, sessionID)
+  const children = await getChildSessions(ctx, sessionID)
   const childWithStats = children.filter(c => sessions.has(c.id))
   if (childWithStats.length > 0) {
     lines.push(`Subagents (${childWithStats.length} child sessions):`)
@@ -348,7 +310,7 @@ async function formatSessionStats(client: any, sessionID: string): Promise<strin
   lines.push(`Combined: ${totalApi} turns (${fmtTokens(totalTokens)} tokens)`)
   lines.push(`  Flex:        ${fApi} turns  ${fmtTokens(fTokens)} tokens   Est ${fmtCost(fEst)}   Billed ${fmtCost(fAct)}`)
   lines.push(`  Non-flex:    ${sApi} turns  ${fmtTokens(sTokens)} tokens   Est ${fmtCost(sEst)}   Billed ${fmtCost(sAct)}`)
-  lines.push(`  Estimated cost (models.dev): ${fmtCost(totalEst)}`)
+  lines.push(`  Estimated cost (opencode): ${fmtCost(totalEst)}`)
   lines.push(`  Actual billed cost (NeuralWatt): ${fmtCost(totalAct)}`)
   if (cEnergy > 0) {
     lines.push(`  Energy: ${fmtKwh(cEnergy)}  Carbon: ${fmtCarbon(cCarbon)}  Grid: ${cGrid || "—"}`)
@@ -364,7 +326,7 @@ async function formatSessionStats(client: any, sessionID: string): Promise<strin
   lines.push("")
   lines.push(BAR)
   lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
-  lines.push('"Est.Cost" = opencode models.dev estimate (list price). "Billed" = NeuralWatt actual.')
+  lines.push('"Est.Cost" = opencode cost estimate (list price). "Billed" = NeuralWatt actual.')
   lines.push(BAR)
   return lines.join("\n")
 }
@@ -457,7 +419,7 @@ function formatOverallStats(): string {
   lines.push("")
   lines.push(BAR)
   lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
-  lines.push('"Est.Cost" = opencode models.dev estimate (list price). "Act.Cost" = NeuralWatt actual.')
+  lines.push('"Est.Cost" = opencode cost estimate (list price). "Act.Cost" = NeuralWatt actual.')
   lines.push("Energy/carbon from NeuralWatt SSE telemetry.")
   lines.push(BAR)
   return lines.join("\n")
@@ -465,19 +427,20 @@ function formatOverallStats(): string {
 
 // ============ Plugin ============
 
-export default (async ({ client }) => {
-  patchFetch()
+export default {
+  id: "neuralwatt-flex",
 
-  return {
-    "chat.params": async (input, output) => {
-      const providerID = input.provider?.info?.id ?? input.model?.providerID
-      if (providerID !== NEURALWATT_PROVIDER_ID) return
+  async setup(ctx) {
+    // ---- 1. Flex injection + per-session bookkeeping -----------------
+    // `context` runs for the agent loop, `compaction` and `generate` for the
+    // auxiliary model requests V1 also flexed. Title generation is excluded,
+    // matching V1 behaviour.
+    const onModelContext = (event: SessionContext): void => {
+      if (event?.model?.providerID !== NEURALWATT_PROVIDER_ID) return
 
-      const agent = input.agent ?? "unknown"
-      if (agent === "title") return
-
-      const modelID = input.model?.id ?? "unknown"
-      const sessionID = input.sessionID ?? "unknown"
+      const modelID: string = event.model?.id ?? "unknown"
+      const agent: string = event.agent ?? "unknown"
+      const sessionID: string = event.sessionID ?? "unknown"
 
       const isFlex = !disabledModels.has(modelID)
       sessionInfo.set(sessionID, { modelID, agent, flex: isFlex })
@@ -487,119 +450,150 @@ export default (async ({ client }) => {
         return
       }
 
-      output.options.service_tier = "flex"
-    },
+      event.options.service_tier = "flex"
+    }
+    await ctx.session.hook("context", onModelContext, { providerID: NEURALWATT_PROVIDER_ID })
+    await ctx.session.hook("compaction", onModelContext, { providerID: NEURALWATT_PROVIDER_ID })
+    await ctx.session.hook("generate", onModelContext, { providerID: NEURALWATT_PROVIDER_ID })
 
-    "chat.headers": async (input, output) => {
-      const providerID = input.provider?.info?.id ?? input.model?.providerID
-      if (providerID !== NEURALWATT_PROVIDER_ID) return
-      output.headers["x-flex-session-id"] = input.sessionID ?? "unknown"
-    },
+    // ---- 2. Guaranteed request-body injection + correlation header ----
+    // The `service_tier` provider option above is the semantic path; this
+    // hook enforces the field on the final HTTP body no matter how the
+    // protocol lowers options, and tags the request with the session id so
+    // NeuralWatt telemetry can be correlated back.
+    await ctx.session.hook("http.request", async (event) => {
+      const request = event.request
+      let url = ""
+      try { url = new URL(request.url).href } catch { return }
+      if (!url.includes(NEURALWATT_HOST) || !url.includes("chat/completions")) return
 
-    event: async ({ event }) => {
-      if (event.type === "message.updated") {
-        const info = (event as any).properties?.info
-        if (!info || info.role !== "assistant") return
+      try { request.headers.set("x-flex-session-id", event.sessionID) } catch {}
 
-        const providerID: string = info.providerID
-        if (providerID !== NEURALWATT_PROVIDER_ID) return
+      let body: any
+      try {
+        const text = await request.clone().text()
+        body = text ? JSON.parse(text) : {}
+        if (!body || typeof body !== "object") return
+      } catch { return }
 
-        const msgID: string = info.id
-        const sessionID: string = info.sessionID
-        const modelID: string = info.modelID
-
-        const current = {
-          input: info.tokens?.input ?? 0,
-          output: info.tokens?.output ?? 0,
-          reasoning: info.tokens?.reasoning ?? 0,
-          cacheRead: info.tokens?.cache?.read ?? 0,
-          cacheWrite: info.tokens?.cache?.write ?? 0,
-          cost: info.cost ?? 0,
+      const modelID = typeof body.model === "string" ? body.model : undefined
+      if (modelID && disabledModels.has(modelID)) {
+        if (body.service_tier !== undefined) {
+          delete body.service_tier
+          try { event.request = new Request(request, { body: JSON.stringify(body) }) } catch {}
         }
+        return
+      }
+      if (body.service_tier !== "flex") {
+        body.service_tier = "flex"
+        try { event.request = new Request(request, { body: JSON.stringify(body) }) } catch {}
+      }
+    }, { providerID: NEURALWATT_PROVIDER_ID })
 
-        const last = lastTokensByMsg.get(msgID) ?? { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+    // ---- 3. Telemetry capture from the SSE stream ---------------------
+    await ctx.session.hook("http.response", (event) => {
+      const response = event.response
+      const ct = response.headers.get("content-type") ?? ""
+      if (!response.body || !ct.includes("text/event-stream")) return
+      event.response = interceptResponse(event.sessionID, response)
+    }, { providerID: NEURALWATT_PROVIDER_ID })
 
-        const dInput = current.input - last.input
-        const dOutput = current.output - last.output
-        const dReasoning = current.reasoning - last.reasoning
-        const dCacheRead = current.cacheRead - last.cacheRead
-        const dCacheWrite = current.cacheWrite - last.cacheWrite
-        const dCost = current.cost - last.cost
+    // ---- 4. Event stream: per-step accounting + error fallback ---------
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+          if (ev.type === "session.step.ended" || ev.type === "session.step.failed") {
+            const data = (ev as any).data
+            const sessionID: string | undefined = data?.sessionID
+            if (!sessionID) continue
 
-        if (dInput !== 0 || dOutput !== 0 || dCost !== 0 || dReasoning !== 0 || dCacheRead !== 0 || dCacheWrite !== 0) {
-          const sInfo = sessionInfo.get(sessionID)
-          const agent = sInfo?.agent ?? "unknown"
-          const flex = sInfo?.flex ?? !disabledModels.has(modelID)
+            // Only NeuralWatt sessions are tracked (the context hook above
+            // registers them); keeps other providers out of the stats.
+            const sInfo = sessionInfo.get(sessionID)
+            if (!sInfo) continue
 
-          const stats = getOrCreateModel(sessionID, modelID, agent, flex)
+            const tokens = data.tokens
+            const cost = typeof data.cost === "number" ? data.cost : 0
+            if (!tokens && !cost) continue
 
-          stats.apiCalls++
-          stats.tokens.input += dInput
-          stats.tokens.output += dOutput
-          stats.tokens.reasoning += dReasoning
-          stats.tokens.cacheRead += dCacheRead
-          stats.tokens.cacheWrite += dCacheWrite
-          stats.estimatedCost += dCost
-
-          const cap = popCapture(sessionID, modelID)
-          if (cap) {
-            if (cap.energy) {
-              const e = cap.energy
-              stats.energyJoules += e.energy_joules ?? 0
-              stats.energyKwh += e.energy_kwh ?? 0
-              stats.carbonG += e.carbon_g_co2eq ?? 0
-              if (e.grid_id) stats.gridId = e.grid_id
+            const stats = getOrCreateModel(sessionID, sInfo.modelID, sInfo.agent, sInfo.flex)
+            stats.apiCalls++
+            if (tokens) {
+              stats.tokens.input += tokens.input ?? 0
+              stats.tokens.output += tokens.output ?? 0
+              stats.tokens.reasoning += tokens.reasoning ?? 0
+              stats.tokens.cacheRead += tokens.cache?.read ?? 0
+              stats.tokens.cacheWrite += tokens.cache?.write ?? 0
             }
-            if (cap.cost) {
-              const c = cap.cost
-              stats.actualCost += c.request_cost_usd ?? 0
-              stats.cacheSavings += c.cache_savings_usd ?? 0
-              stats.lastAllowanceRemaining = c.allowance_remaining_usd
+            stats.estimatedCost += cost
+
+            const cap = popCapture(sessionID)
+            if (cap) {
+              if (cap.energy) {
+                const e = cap.energy
+                stats.energyJoules += e.energy_joules ?? 0
+                stats.energyKwh += e.energy_kwh ?? 0
+                stats.carbonG += e.carbon_g_co2eq ?? 0
+                if (e.grid_id) stats.gridId = e.grid_id
+              }
+              if (cap.cost) {
+                const c = cap.cost
+                stats.actualCost += c.request_cost_usd ?? 0
+                stats.cacheSavings += c.cache_savings_usd ?? 0
+                stats.lastAllowanceRemaining = c.allowance_remaining_usd
+              }
+            }
+          }
+
+          if (ev.type === "session.step.failed" || ev.type === "session.execution.failed") {
+            const data = (ev as any).data
+            const error = data?.error
+            if (!error || !data?.sessionID) continue
+
+            const errorStr = JSON.stringify(error).toLowerCase()
+            if (!errorStr.includes("flex") && !errorStr.includes("service_tier")) continue
+
+            const sInfo = sessionInfo.get(data.sessionID)
+            const modelID = sInfo?.modelID
+            if (modelID && !disabledModels.has(modelID)) {
+              disabledModels.add(modelID)
+              console.warn(`[neuralwatt-flex] Disabled flex for ${modelID}`)
             }
           }
         }
-
-        lastTokensByMsg.set(msgID, { ...current })
-        return
-      }
-
-      if (event.type === "session.error") {
-        const props = (event as any).properties
-        if (!props) return
-        const errorStr = JSON.stringify(props).toLowerCase()
-        if (!errorStr.includes("flex") && !errorStr.includes("service_tier")) return
-
-        const error = props.error
-        const modelID = error?.data?.modelID ?? error?.modelID
-        if (modelID) {
-          disabledModels.add(modelID)
-          try {
-            await client.app.log({
-              body: { service: "neuralwatt-flex", level: "warn", message: `Disabled flex for ${modelID}` },
-            })
-          } catch {}
+      } catch (err: any) {
+        if (err?.name !== "AbortError") {
+          console.error("[neuralwatt-flex] event subscription failed:", err)
         }
       }
-    },
+    })()
 
-    tool: {
-      "flex-session": tool({
+    // ---- 5. Reporting tools -------------------------------------------
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "flex-session",
         description:
-          "Show NeuralWatt flex stats for the current session and all subagent child sessions. Per-model breakdown split into flex (discounted) and non-flex (std fallback) tiers, with API calls, tokens, estimated cost (models.dev), actual billed cost (NeuralWatt), energy, and carbon emissions.",
-        args: {},
-        async execute(_args, context) {
+          "Show NeuralWatt flex stats for the current session and all subagent child sessions. Per-model breakdown split into flex (discounted) and non-flex (std fallback) tiers, with API calls, tokens, estimated cost, actual billed cost (NeuralWatt), energy, and carbon emissions.",
+        options: { codemode: false },
+        input: { type: "object", properties: {}, additionalProperties: false },
+        async execute(_input, context) {
           const sessionID = context.sessionID ?? "unknown"
-          return await formatSessionStats(client, sessionID)
+          return { content: await formatSessionStats(ctx, sessionID) }
         },
-      }),
-      "flex-stats": tool({
+      })
+      editor.add({
+        name: "flex-stats",
         description:
           "Show overall NeuralWatt flex stats across all sessions in the process lifetime, broken down by agent, model, and tier (flex vs non-flex). Includes API calls, tokens, estimated cost, actual billed cost, flex rate, energy, and carbon.",
-        args: {},
+        options: { codemode: false },
+        input: { type: "object", properties: {}, additionalProperties: false },
         async execute() {
-          return formatOverallStats()
+          return { content: formatOverallStats() }
         },
-      }),
-    },
-  }
-}) satisfies Plugin
+      })
+    })
+
+    return () => controller.abort()
+  },
+} satisfies Plugin.Plugin

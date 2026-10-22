@@ -2,7 +2,7 @@
 
 An [opencode](https://opencode.ai) plugin that silently routes your **NeuralWatt** traffic onto cheaper, lower-priority **flex** capacity whenever it's available, and gives you per-session reporting on usage, cost, energy and carbon.
 
-It is a single TypeScript file with no build step and no network calls of its own. opencode loads it directly.
+It is a small TypeScript package with no build step and no network calls of its own. opencode loads it directly. Requires OpenCode V2 (the V1 plugin API build is no longer supported; see `CHANGELOG.md`).
 
 ---
 
@@ -31,13 +31,13 @@ This repo is npm-ready but not published to the npm registry. Pick whichever for
 git clone https://github.com/logicalor/neuralwatt-flex.git ~/.config/opencode/plugins/neuralwatt-flex
 ```
 
-Then add the plugin to your opencode config (`~/.config/opencode/opencode.json`, or `.opencode/opencode.json` in a project):
+Then add the plugin to your opencode config (`~/.config/opencode/opencode.jsonc`, or `.opencode/opencode.jsonc` in a project). OpenCode V2 resolves local plugin **directories** (through their `server.ts` entry), so point the `plugins` array at the checkout:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "./plugins/neuralwatt-flex/src/neuralwatt-flex.ts"
+  "plugins": [
+    "./plugins/neuralwatt-flex"
   ],
   "permission": {
     "tool": {
