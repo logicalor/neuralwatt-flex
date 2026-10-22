@@ -45,6 +45,10 @@ const sessions = new Map<string, Map<string, ModelTiers>>()
 const disabledModels = new Set<string>()
 const sessionInfo = new Map<string, { modelID: string; agent: string; flex: boolean }>()
 const captureBySession = new Map<string, Array<{ energy?: any; cost?: any }>>()
+// sessionID -> parentID (null = root). Populated from session.created events
+// and lazily from ctx.session.get, because this server build's plugin context
+// has no session.list/children method.
+const parentOf = new Map<string, string | null>()
 
 // ============ Helpers ============
 
@@ -188,15 +192,25 @@ function interceptResponse(sessionID: string, response: Response): Response {
 
 // ============ Session tree ============
 
+/** Record a session's parent lazily (first time we account a step for it). */
+function ensureParentKnown(ctx: Plugin.Context, sessionID: string): void {
+  if (parentOf.has(sessionID)) return
+  parentOf.set(sessionID, null)
+  void ctx.session
+    .get({ sessionID } as any)
+    .then((response: any) => {
+      const info = response?.data ?? response
+      if (info?.parentID) parentOf.set(sessionID, info.parentID)
+    })
+    .catch(() => {})
+}
+
 async function getChildSessions(ctx: Plugin.Context, sessionID: string): Promise<Array<{ id: string; title: string }>> {
   const result: Array<{ id: string; title: string }> = []
   try {
-    const page: any = await ctx.session.list({ parentID: sessionID, limit: 100 })
-    const children: any[] = page?.data ?? (Array.isArray(page) ? page : [])
-    for (const child of children) {
-      const id: string = child?.id ?? ""
-      if (!id) continue
-      result.push({ id, title: child?.title ?? "" })
+    const direct = [...parentOf.entries()].filter(([, parent]) => parent === sessionID).map(([id]) => id)
+    for (const id of direct) {
+      result.push({ id, title: "" })
       result.push(...(await getChildSessions(ctx, id)))
     }
   } catch {}
@@ -503,6 +517,11 @@ export default {
     void (async () => {
       try {
         for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+          if (ev.type === "session.created") {
+            const data = (ev as any).data
+            if (data?.sessionID) parentOf.set(data.sessionID, data.parentID ?? null)
+          }
+
           if (ev.type === "session.step.ended" || ev.type === "session.step.failed") {
             const data = (ev as any).data
             const sessionID: string | undefined = data?.sessionID
@@ -512,6 +531,8 @@ export default {
             // registers them); keeps other providers out of the stats.
             const sInfo = sessionInfo.get(sessionID)
             if (!sInfo) continue
+
+            ensureParentKnown(ctx, sessionID)
 
             const tokens = data.tokens
             const cost = typeof data.cost === "number" ? data.cost : 0
