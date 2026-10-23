@@ -1,5 +1,5 @@
 {
-  "name": "neuralwatt-flex",
+  "name": "@logical-or/neuralwatt-flex",
   "version": "0.3.0",
   "description": "opencode plugin that silently routes NeuralWatt traffic to flex models and reports per-session usage, cost, energy and carbon telemetry.",
   "type": "module",
@@ -19,11 +19,15 @@
     "./server": "./server.ts"
   },
   "files": [
+    "server.ts",
     "src",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",

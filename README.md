@@ -23,7 +23,7 @@ If a model errors on the flex tier, the plugin **auto-disables** flex for that m
 
 ## Install
 
-This repo is npm-ready but not published to the npm registry. Pick whichever form you prefer.
+This repo is npm-ready. Pick whichever form you prefer.
 
 ### Option A — clone + local path reference (recommended)
 
@@ -50,17 +50,17 @@ Then add the plugin to your opencode config (`~/.config/opencode/opencode.jsonc`
 
 Paths in the `plugins` array are resolved relative to the config file, so this mirrors where you cloned it. The `permission` block is optional — without it opencode will ask before each tool runs.
 
-### Option B — install from GitHub as a package
+### Option B — install from npm
 
 ```bash
-npm install github:logicalor/neuralwatt-flex
+npm install @logical-or/neuralwatt-flex
 ```
 
 Then reference the package by name (it ships the `.ts` entry, no compile needed):
 
 ```jsonc
 {
-  "plugins": ["neuralwatt-flex"]
+  "plugins": ["@logical-or/neuralwatt-flex"]
 }
 ```
 
