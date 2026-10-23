@@ -70,12 +70,27 @@ The only thing the plugin needs to function is a working NeuralWatt provider in 
 
 ## Tools
 
-The plugin exposes two read-only reporting tools. Neither makes network requests.
+The plugin exposes three tools. None makes network requests.
 
 | Tool | Scope | Output |
 |------|-------|--------|
 | `flex-session` | The current session **and** all subagent child sessions | Per-model table for the main session, a per-model table for each subagent, combined totals, disabled models, and the last known allowance remaining. |
 | `flex-stats` | Process lifetime (every session in this opencode process) | Rollup aggregated by **agent × model** with session counts and an overall flex rate (`flex turns / (flex turns + skipped turns)`). |
+| `flex-toggle` | Global (this opencode config) | List per-model flex state, or `disable` / `enable` / `reset` per model or glob pattern. |
+
+### Toggling flex per model
+
+Flex is **on by default** for every model. Turn it off per model (or pattern) with the `flex-toggle` tool or the `/flex` slash command:
+
+```text
+/flex                        # list every model's state
+/flex off kimi-k3            # disable one model (persistent)
+/flex off deepseek-*         # disable by glob pattern
+/flex on kimi-k3             # re-enable (also clears auto-disables)
+/flex reset                  # everything back on
+```
+
+Preferences persist in `~/.config/opencode/.neuralwatt-flex.json` and are shared by every opencode server reading this config; the file is re-read when it changes on disk, and can be edited by hand. Patterns without a `/` match bare model IDs (`deepseek-*`); patterns with a `/` match the full `neuralwatt/<model>` reference. Models disabled here run on the standard tier and show `[std]` + `*` in the stats reports.
 
 Both prints distinguish two cost figures:
 

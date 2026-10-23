@@ -1,6 +1,6 @@
 {
   "name": "neuralwatt-flex",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "opencode plugin that silently routes NeuralWatt traffic to flex models and reports per-session usage, cost, energy and carbon telemetry.",
   "type": "module",
   "license": "MIT",
@@ -38,6 +38,7 @@
   ],
   "devDependencies": {
     "@opencode/plugin": "2.1.2",
+    "@types/node": "^22.10.0",
     "typescript": "^5.6.0"
   },
   "scripts": {

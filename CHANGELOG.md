@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-24
+
+### Added
+- **Per-model flex toggling** (on by default):
+  - `flex-toggle` tool — actions: `list` (per-model effective state), `disable` / `enable` (by model ID or glob pattern, e.g. `deepseek-*`), `reset` (clear all disables).
+  - `/flex` slash command sharing the same logic — `/flex` lists, `/flex off <model-or-pattern>`, `/flex on <model-or-pattern>`, `/flex reset`. Executes directly in the plugin (no model round-trip) and reports the result as a synthetic message.
+  - Preferences persist in `~/.config/opencode/.neuralwatt-flex.json` (`{"disabled": ["pattern", ...]}`) and are shared across server processes; the file is re-read when it changes on disk.
+  - Patterns without a `/` match bare model IDs; patterns with a `/` match the full `neuralwatt/<model>` reference. `enable` also clears matching auto-disables, so a model that errored on the flex tier can be re-enabled without a restart.
+- Stats reports now distinguish `User-disabled (persistent)` from `Auto-disabled (this process)`.
+
 ## [0.2.0] - 2026-10-22
 
 ### Changed

@@ -10,6 +10,9 @@
  */
 import type { Plugin } from "@opencode/plugin"
 import type { SessionContext } from "@opencode/plugin/promise/session"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import * as os from "node:os"
 
 const NEURALWATT_PROVIDER_ID = "neuralwatt"
 const NEURALWATT_HOST = "api.neuralwatt.com"
@@ -49,6 +52,166 @@ const captureBySession = new Map<string, Array<{ energy?: any; cost?: any }>>()
 // and lazily from ctx.session.get, because this server build's plugin context
 // has no session.list/children method.
 const parentOf = new Map<string, string | null>()
+
+// ============ Per-model user toggles ============
+//
+// Flex is ON by default for every model. The user can turn it off per model
+// (or per glob pattern) through the flex-toggle tool or the /flex command;
+// those preferences persist in a state file shared by every opencode server
+// process reading this config. Auto-disable (a model erroring on the flex
+// tier) stays transient and in-memory, separate from these preferences.
+
+function configDir(): string {
+  if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, "opencode")
+  return path.join(os.homedir(), ".config", "opencode")
+}
+const FLEX_STATE_FILE = path.join(configDir(), ".neuralwatt-flex.json")
+
+let userDisabledPatterns: string[] = []
+let flexStateMtime = 0
+
+function readFlexStateFile(): void {
+  try {
+    const raw = fs.readFileSync(FLEX_STATE_FILE, "utf8")
+    const parsed = JSON.parse(raw)
+    const list = parsed && Array.isArray(parsed.disabled)
+      ? parsed.disabled.filter((p: unknown): p is string => typeof p === "string" && p.length > 0)
+      : []
+    userDisabledPatterns = list
+  } catch (err: any) {
+    // No file yet = everything on. A malformed file keeps the in-memory state.
+    if (err?.code === "ENOENT") userDisabledPatterns = []
+  }
+}
+
+function writeFlexStateFile(): void {
+  try {
+    fs.mkdirSync(path.dirname(FLEX_STATE_FILE), { recursive: true })
+    fs.writeFileSync(FLEX_STATE_FILE, JSON.stringify({ disabled: userDisabledPatterns }, null, 2) + "\n", { mode: 0o644 })
+    flexStateMtime = fs.statSync(FLEX_STATE_FILE).mtimeMs
+  } catch {}
+}
+
+/** Re-read the state file when it changed on disk (e.g. toggled from another server process). */
+function refreshUserDisabled(): void {
+  try {
+    const mtime = fs.statSync(FLEX_STATE_FILE).mtimeMs
+    if (mtime !== flexStateMtime) {
+      flexStateMtime = mtime
+      readFlexStateFile()
+    }
+  } catch {
+    if (flexStateMtime !== 0) {
+      flexStateMtime = 0
+      userDisabledPatterns = []
+    }
+  }
+}
+
+function patternToRegex(pattern: string): RegExp {
+  const esc = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")
+  return new RegExp(`^${esc}$`, "i")
+}
+
+/** Glob match with `*` and `?` wildcards. */
+function globMatches(pattern: string, subject: string): boolean {
+  return patternToRegex(pattern).test(subject)
+}
+
+/**
+ * Does a stored pattern disable this model? Patterns without a "/" match the
+ * bare model ID ("deepseek-*"); patterns with a "/" match the full
+ * "neuralwatt/<model>" form, so a pattern with a leading wildcard matches
+ * the model under any provider spelling.
+ */
+function patternMatchesModel(pattern: string, modelID: string): boolean {
+  if (pattern.includes("/")) return globMatches(pattern, `${NEURALWATT_PROVIDER_ID}/${modelID}`)
+  return globMatches(pattern, modelID)
+}
+
+function isUserDisabled(modelID: string): boolean {
+  refreshUserDisabled()
+  return userDisabledPatterns.some(p => patternMatchesModel(p, modelID))
+}
+
+/** Flex runs only when the model is neither user-disabled nor auto-disabled. */
+function isFlexEnabled(modelID: string): boolean {
+  return !isUserDisabled(modelID) && !disabledModels.has(modelID)
+}
+
+/** The NeuralWatt models worth reporting in the toggle table. */
+async function knownNeuralwattModels(ctx: Plugin.Context): Promise<string[]> {
+  const models = new Set<string>()
+  try {
+    const response: any = await ctx.model.list()
+    const arr = response?.data ?? response ?? []
+    if (Array.isArray(arr)) {
+      for (const m of arr) {
+        if (m?.providerID === NEURALWATT_PROVIDER_ID && m?.id) models.add(m.id)
+      }
+    }
+  } catch {}
+  for (const sess of sessions.values()) for (const id of sess.keys()) models.add(id)
+  for (const info of sessionInfo.values()) models.add(info.modelID)
+  return [...models].sort()
+}
+
+function flexStateTable(models: string[]): string {
+  const lines: string[] = []
+  lines.push("NeuralWatt flex routing (on by default):")
+  if (models.length === 0) {
+    lines.push("  (no NeuralWatt models known yet)")
+  }
+  for (const modelID of models) {
+    const userPat = userDisabledPatterns.find(p => patternMatchesModel(p, modelID))
+    if (userPat !== undefined) lines.push(`  ${modelID}: off (user: ${userPat})`)
+    else if (disabledModels.has(modelID)) lines.push(`  ${modelID}: off (auto-disabled this process)`)
+    else lines.push(`  ${modelID}: on`)
+  }
+  lines.push(`Stored patterns: ${userDisabledPatterns.length === 0 ? "(none)" : userDisabledPatterns.join(", ")}`)
+  lines.push(`Toggle with the flex-toggle tool or /flex [off|on] <model-or-pattern>; state file: ${FLEX_STATE_FILE}`)
+  return lines.join("\n")
+}
+
+function applyFlexToggle(action: string, model: string | undefined): { ok: boolean; message: string } {
+  refreshUserDisabled()
+  if (!model) return { ok: false, message: `a model or pattern is required for '${action}'` }
+
+  if (action === "disable") {
+    if (userDisabledPatterns.includes(model)) {
+      return { ok: true, message: `${model} is already disabled.` }
+    }
+    userDisabledPatterns.push(model)
+    writeFlexStateFile()
+    return { ok: true, message: `Flex OFF for ${model} (persistent). Matching models now run on the standard tier.` }
+  }
+
+  if (action === "enable") {
+    // Remove the exact entry, any stored pattern that matches this model, and
+    // any stored pattern the argument itself globs onto; also clear matching
+    // auto-disables so a flex-errored model can be re-enabled without a restart.
+    const hit = (p: string): boolean => p === model || globMatches(p, model) || globMatches(model, p)
+    const removed = userDisabledPatterns.filter(hit)
+    if (removed.length > 0) userDisabledPatterns = userDisabledPatterns.filter(p => !hit(p))
+    let clearedAuto = 0
+    for (const id of [...disabledModels]) {
+      if (id === model || globMatches(model, id)) {
+        disabledModels.delete(id)
+        clearedAuto++
+      }
+    }
+    if (removed.length === 0 && clearedAuto === 0) {
+      return { ok: true, message: `${model} was not disabled — flex is already on.` }
+    }
+    writeFlexStateFile()
+    const parts: string[] = []
+    if (removed.length > 0) parts.push(`removed pattern(s): ${removed.join(", ")}`)
+    if (clearedAuto > 0) parts.push(`cleared ${clearedAuto} auto-disabled model(s)`)
+    return { ok: true, message: `Flex ON for ${model} (${parts.join("; ")}).` }
+  }
+
+  return { ok: false, message: `unknown action: ${action}` }
+}
 
 // ============ Helpers ============
 
@@ -224,7 +387,7 @@ const DASH = "─".repeat(78)
 
 function modelTierRows(label: string, s: ModelStats, W: { model: number; api: number; tokens: number; est: number; act: number; energy: number; grid: number }): { line: string; active: boolean } {
   if (!hasActivity(s)) return { line: "", active: false }
-  const flag = s.tier === "std" && disabledModels.has(label.split(" [")[0]) ? " *" : ""
+  const flag = s.tier === "std" && !isFlexEnabled(label.split(" [")[0]) ? " *" : ""
   const line =
     `  ${pad(tierLabel(label, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)} ${pad(s.gridId || "—", W.grid)}`
   return { line, active: true }
@@ -288,7 +451,7 @@ async function formatSessionStats(ctx: Plugin.Context, sessionID: string): Promi
       for (const [modelID, tiers] of sess) {
         for (const s of [tiers.flex, tiers.std]) {
           if (!hasActivity(s)) continue
-          const flag = s.tier === "std" && disabledModels.has(modelID) ? " *" : ""
+          const flag = s.tier === "std" && !isFlexEnabled(modelID) ? " *" : ""
           lines.push(
             `  ${pad(child.id, W.sid)} ${pad(s.agent, W.agent)} ${pad(tierLabel(modelID, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
           )
@@ -335,8 +498,10 @@ async function formatSessionStats(ctx: Plugin.Context, sessionID: string): Promi
   }
 
   lines.push("")
-  lines.push(`Disabled models: ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
-  if (disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
+  refreshUserDisabled()
+  lines.push(`User-disabled (persistent): ${userDisabledPatterns.length === 0 ? "(none)" : userDisabledPatterns.join(", ")}`)
+  lines.push(`Auto-disabled (this process): ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
+  if (userDisabledPatterns.length > 0 || disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
   lines.push("")
   lines.push(BAR)
   lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
@@ -396,7 +561,7 @@ function formatOverallStats(): string {
     if (!hasActivity(s)) continue
     const [agent, modelID] = key.split("\u0000")
     const sessCount = sessionCountByAgentModelTier.get(key)?.size ?? 0
-    const flag = s.tier === "std" && disabledModels.has(modelID) ? " *" : ""
+    const flag = s.tier === "std" && !isFlexEnabled(modelID) ? " *" : ""
     lines.push(
       `  ${pad(agent, W.agent)} ${pad(tierLabel(modelID, s.tier) + flag, W.model)} ${padR(String(s.apiCalls), W.api)} ${padR(String(sessCount), W.sess)} ${padR(fmtTokens(tokenTotal(s)), W.tokens)} ${padR(fmtCost(s.estimatedCost), W.est)} ${padR(fmtCost(s.actualCost), W.act)} ${padR(fmtKwh(s.energyKwh), W.energy)}`
     )
@@ -428,8 +593,10 @@ function formatOverallStats(): string {
   }
 
   lines.push("")
-  lines.push(`Disabled models: ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
-  if (disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
+  refreshUserDisabled()
+  lines.push(`User-disabled (persistent): ${userDisabledPatterns.length === 0 ? "(none)" : userDisabledPatterns.join(", ")}`)
+  lines.push(`Auto-disabled (this process): ${disabledModels.size === 0 ? "(none)" : [...disabledModels].join(", ")}`)
+  if (userDisabledPatterns.length > 0 || disabledModels.size > 0) lines.push("  (* = std tier, flex disabled for that model)")
   lines.push("")
   lines.push(BAR)
   lines.push('Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.')
@@ -456,7 +623,7 @@ export default {
       const agent: string = event.agent ?? "unknown"
       const sessionID: string = event.sessionID ?? "unknown"
 
-      const isFlex = !disabledModels.has(modelID)
+      const isFlex = isFlexEnabled(modelID)
       sessionInfo.set(sessionID, { modelID, agent, flex: isFlex })
 
       if (!isFlex) {
@@ -491,7 +658,7 @@ export default {
       } catch { return }
 
       const modelID = typeof body.model === "string" ? body.model : undefined
-      if (modelID && disabledModels.has(modelID)) {
+      if (modelID && !isFlexEnabled(modelID)) {
         if (body.service_tier !== undefined) {
           delete body.service_tier
           try { event.request = new Request(request, { body: JSON.stringify(body) }) } catch {}
@@ -577,7 +744,7 @@ export default {
 
             const sInfo = sessionInfo.get(data.sessionID)
             const modelID = sInfo?.modelID
-            if (modelID && !disabledModels.has(modelID)) {
+            if (modelID && !disabledModels.has(modelID) && !isUserDisabled(modelID)) {
               disabledModels.add(modelID)
               console.warn(`[neuralwatt-flex] Disabled flex for ${modelID}`)
             }
@@ -611,6 +778,114 @@ export default {
         input: { type: "object", properties: {}, additionalProperties: false },
         async execute() {
           return { content: formatOverallStats() }
+        },
+      })
+      editor.add({
+        name: "flex-toggle",
+        description:
+          "Toggle NeuralWatt flex routing per model (on by default). Actions: 'list' shows each model's effective state; 'disable' turns flex off for a model or glob pattern (e.g. 'glm-5.3', 'deepseek-*', '*/kimi-k3'); 'enable' turns flex back on and also clears auto-disables; 'reset' clears every disable. Preferences persist in ~/.config/opencode/.neuralwatt-flex.json.",
+        options: { codemode: false },
+        input: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["list", "enable", "disable", "reset"],
+              description: "The toggle operation",
+            },
+            model: {
+              type: "string",
+              description: "Model ID or glob pattern (e.g. 'glm-5.3', 'deepseek-*'). Required for enable/disable.",
+            },
+          },
+          required: ["action"],
+          additionalProperties: false,
+        },
+        async execute(input: any) {
+          const args = (input ?? {}) as { action?: string; model?: string }
+          if (args.action === "list") {
+            refreshUserDisabled()
+            return { content: flexStateTable(await knownNeuralwattModels(ctx)) }
+          }
+          if (args.action === "reset") {
+            refreshUserDisabled()
+            const removed = [...userDisabledPatterns]
+            userDisabledPatterns = []
+            disabledModels.clear()
+            writeFlexStateFile()
+            return {
+              content: removed.length > 0
+                ? `Cleared ${removed.length} pattern(s): ${removed.join(", ")}. All models flex-on.`
+                : "Nothing to clear — all models already flex-on.",
+            }
+          }
+          if (args.action !== "enable" && args.action !== "disable") {
+            return { content: `Error: unknown action: ${String(args.action)}` }
+          }
+          const r = applyFlexToggle(args.action, args.model)
+          return { content: r.ok ? r.message : `Error: ${r.message}` }
+        },
+      })
+    })
+
+    // ---- 6. /flex command ----------------------------------------------
+    // Executes the toggle directly (no model round-trip) and reports the
+    // result into the session as a synthetic message.
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "flex",
+        description: "Toggle NeuralWatt flex routing per model (on by default): /flex [off <model-or-pattern> | on <model-or-pattern> | reset]. Bare /flex lists the current state.",
+        execute: async ({ sessionID, prompt }) => {
+          const raw = (prompt.text ?? "").trim()
+          const text = raw.replace(/^\s*\/flex\b/i, "").trim()
+          const tokens = text.split(/\s+/).filter(Boolean)
+
+          let action = "list"
+          let model: string | undefined
+          if (tokens.length > 0) {
+            const head = tokens[0]!.toLowerCase()
+            if (head === "off" || head === "disable") {
+              action = "disable"
+              model = tokens.slice(1).join(" ") || undefined
+            } else if (head === "on" || head === "enable") {
+              action = "enable"
+              model = tokens.slice(1).join(" ") || undefined
+            } else if (head === "reset") {
+              action = "reset"
+            } else if (head === "list" || head === "status") {
+              action = "list"
+            } else {
+              action = "unknown"
+            }
+          }
+
+          let message: string
+          if (action === "unknown") {
+            message = `Unknown /flex arguments: ${text}\nUsage: /flex [off <model-or-pattern> | on <model-or-pattern> | reset]`
+          } else if (action === "list") {
+            refreshUserDisabled()
+            message = flexStateTable(await knownNeuralwattModels(ctx))
+          } else if (action === "reset") {
+            refreshUserDisabled()
+            const removed = [...userDisabledPatterns]
+            userDisabledPatterns = []
+            disabledModels.clear()
+            writeFlexStateFile()
+            message = removed.length > 0
+              ? `Cleared ${removed.length} pattern(s): ${removed.join(", ")}. All models flex-on.`
+              : "Nothing to clear — all models already flex-on."
+          } else {
+            const r = applyFlexToggle(action, model)
+            message = r.ok ? r.message : `Error: ${r.message}`
+          }
+
+          try {
+            await ctx.session.synthetic({ sessionID, text: `[neuralwatt-flex] ${message}` })
+          } catch {
+            // If synthetic messages are unavailable, fall back to a prompt the
+            // agent simply relays.
+            await ctx.session.prompt({ sessionID, text: `[neuralwatt-flex] ${message}\n\nReply with the message above verbatim, nothing else.`, delivery: "steer" })
+          }
         },
       })
     })
