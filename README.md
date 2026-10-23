@@ -12,7 +12,7 @@ When opencode sends a request to the NeuralWatt provider (`api.neuralwatt.com/ch
 
 1. **Injects `service_tier: "flex"`** into the request body. Eligible turns then run on flex capacity at a discount instead of the standard tier — invisibly, with no change to your prompts or workflow.
 2. **Tagging + teardown for telemetry.** It attaches an `x-flex-session-id` header so NeuralWatt's streaming telemetry can be correlated back to the opencode session that caused it, then parses the `:energy` and `:cost` SSE comment lines NeuralWatt emits alongside the streamed response.
-3. **Aggregates everything** into per-session and per-model stats — flex turns, API calls, token breakdown, estimated vs actual cost, energy, carbon, grid id, and your remaining allowance — and exposes two tools you can call from chat (or from anywhere an opencode tool runs) to print a report.
+3. **Aggregates everything** into per-session and per-model stats — flex turns, API calls, token breakdown, estimated vs actual cost, energy, carbon, grid id, and your remaining allowance — and exposes three tools you can call from chat (or from anywhere an opencode tool runs) to print a report or manage per-model toggles.
 
 If a model errors on the flex tier, the plugin **auto-disables** flex for that model and the turn proceeds on standard capacity. Nothing breaks; you just stop getting the discount for that model until the process restarts.
 
@@ -48,7 +48,7 @@ Then add the plugin to your opencode config (`~/.config/opencode/opencode.jsonc`
 }
 ```
 
-Paths in the `plugin` array are resolved relative to the config file, so this mirrors where you cloned it. The `permission` block is optional — without it opencode will ask before each tool runs.
+Paths in the `plugins` array are resolved relative to the config file, so this mirrors where you cloned it. The `permission` block is optional — without it opencode will ask before each tool runs.
 
 ### Option B — install from GitHub as a package
 
@@ -60,7 +60,7 @@ Then reference the package by name (it ships the `.ts` entry, no compile needed)
 
 ```jsonc
 {
-  "plugin": ["neuralwatt-flex"]
+  "plugins": ["neuralwatt-flex"]
 }
 ```
 
@@ -101,49 +101,53 @@ Energy (kWh), carbon (gCO2eq) and grid id come from NeuralWatt's `:energy` SSE t
 
 ## Sample output
 
-A trimmed `flex-session` report (real reports vary; see [`docs/use-cases/tic-tac-toe/`](docs/use-cases/tic-tac-toe/) for a genuine captured run):
+A trimmed `flex-session` report (real reports vary; captured on OpenCode 2.0.x):
 
 ```
 ==============================================================================
 NeuralWatt Flex Stats — Session <session-id>
 ==============================================================================
 
-Main Session (agent: bmad-orchestrator):
+Main Session (agent: build):
 
   Model                  API    Tokens   Est.Cost    Act.Cost        Energy Grid
   ─────────────────────────────────────────────────────────────────────────────────────
-  neuralwatt/glm-5.2       12      8,421     $0.0143      $0.0091  3.40e-4 kWh WEU
+  glm-5.3                   9        1  2,368,625   $0.38078    $0.00322  6.61e-4 kWh US-MIDA-PJM
+  kimi-k3 [std] *           1        1      19,162   $0.05812           $0              —
   ─────────────────────────────────────────────────────────────────────────────────────
-  Total                    12      8,421     $0.0143      $0.0091  3.40e-4 kWh
+  Total                    10        2  2,387,787   $0.43890    $0.00322  6.61e-4 kWh
 
-Combined: 12 flex turns (12 API calls)  8,421 tokens
-  Flex:        12 turns   8,421 tokens   Est $0.0143   Billed $0.0091
-  Non-flex:     0 turns       0 tokens   Est $0        Billed $0
-  Estimated cost (models.dev): $0.0143
-  Actual billed cost (NeuralWatt): $0.0091
-  Energy: 3.40e-4 kWh  Carbon: 7.10e-2g  Grid: WEU
-  Allowance remaining: $42.18
+Combined: 10 turns (2,387,787 tokens)
+  Flex:         9 turns  2,368,625 tokens   Est $0.38078   Billed $0.00322
+  Non-flex:     1 turns    19,162 tokens   Est $0.05812   Billed $0
+  Estimated cost (opencode): $0.43890
+  Actual billed cost (NeuralWatt): $0.00322
+  Energy: 6.61e-4 kWh  Carbon: 2.91e-1g  Grid: US-MIDA-PJM
+  Allowance remaining: $20.08
 
-Disabled models: (none)
+User-disabled (persistent): deepseek-v4.1-flash
+Auto-disabled (this process): (none)
+  (* = std tier, flex disabled for that model)
 
 ==============================================================================
 Note: "Flex" = runs on flex capacity (discounted). "[std]" = non-flex fallback runs.
-"Est.Cost" = opencode models.dev estimate (list price). "Billed" = NeuralWatt actual.
+"Est.Cost" = opencode cost estimate (list price). "Billed" = NeuralWatt actual.
 ==============================================================================
 ```
 
 ## Notes & caveats
 
-- **Flex is best-effort.** Flex capacity is lower-priority and can be unavailable or rejected for a given model. When a model errors on the flex tier, the plugin disables flex for it and subsequent turns proceed on standard capacity. Restart opencode to re-enable flex for disabled models.
-- **Telemetry depends on the stream.** Energy/carbon/actual-cost rows come from SSE comment lines NeuralWatt emits during streaming. Non-streaming responses or provider quirkiness can mean those fields stay at zero for a turn; estimated cost and token counts still work because they come from opencode's own message events.
-- **In-memory only.** Stats live in the opencode process. They are not persisted to disk and are not sent anywhere. Restart opencode and the counters reset.
+- **Flex is best-effort.** Flex capacity is lower-priority and can be unavailable or rejected for a given model. When a model errors on the flex tier, the plugin auto-disables flex for it and subsequent turns proceed on standard capacity. Re-enable it with `/flex on <model>` (or `flex-toggle enable`); without that, the auto-disable clears when the opencode process restarts.
+- **Telemetry depends on the stream.** Energy/carbon/actual-cost rows come from SSE comment lines NeuralWatt emits during streaming. Non-streaming responses or provider quirkiness can mean those fields stay at zero for a turn, and the capture is matched to the *next* completed turn for that session, so billed-cost figures can lag one turn behind; estimated cost and token counts still work because they come from opencode's own message events.
+- **In-memory only.** Stats live in the opencode process. They are not persisted to disk and are not sent anywhere. Restart opencode and the counters reset. (Per-model *toggles* are the exception — those persist in the state file.)
 - **Provider-scoped.** The plugin only acts on the NeuralWatt provider. Other providers in your opencode config are untouched.
+- **Server build note.** Child-session discovery (the `flex-session` subagent section) tracks `session.created` events because some OpenCode 2.0.x server builds don't expose a session-listing method on the plugin context. Subagent rows can therefore miss sessions that were created before the plugin loaded.
 
 ## Privacy
 
 - Does **not** read your API key, secrets, or env.
-- Does **not** make any outbound network requests; it only wraps the `fetch` opencode already issues to NeuralWatt.
-- Does **not** persist or transmit any usage data. Reporting happens locally, in-process, only when you call a tool.
+- Does **not** make any outbound network requests; it only observes and annotates the provider HTTP exchange through opencode's native plugin hooks.
+- Does **not** persist or transmit any usage data. Reporting happens locally, in-process, only when you call a tool. The only file it writes is your own toggle state (`~/.config/opencode/.neuralwatt-flex.json`).
 
 ## Development
 
@@ -154,11 +158,11 @@ npm install
 npm run typecheck
 ```
 
-The source is one file: [`src/neuralwatt-flex.ts`](src/neuralwatt-flex.ts).
+The implementation is one file, [`src/neuralwatt-flex.ts`](src/neuralwatt-flex.ts), exposed through the root-level [`server.ts`](server.ts) package entry that OpenCode V2 resolves for local plugin directories.
 
 ## Use cases
 
-- [`docs/use-cases/tic-tac-toe/`](docs/use-cases/tic-tac-toe/) — a single-file tic-tac-toe app built across an orchestrator and a `bmad-dev` subagent, plus verbatim `flex-session` / `flex-stats` reports from that build.
+- [`docs/use-cases/tic-tac-toe/`](docs/use-cases/tic-tac-toe/) — a single-file tic-tac-toe app built across an orchestrator and a `bmad-dev` subagent, plus verbatim reports captured on the OpenCode V1 plugin build (the report footer has gained the user/auto-disable split since).
 
 ## License
 
